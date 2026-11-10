@@ -121,6 +121,29 @@ type VideoSubscription struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type UserProfile struct {
+	UserID       string            `json:"user_id"`
+	Status       string            `json:"status"`
+	Verify       bool              `json:"verify"`
+	CustomFields map[string]string `json:"custom_fields"`
+	UpdatedAt    time.Time         `json:"updated_at"`
+}
+
+type MonitoredWebsite struct {
+	ID          int       `json:"id"`
+	GuildID     string    `json:"guild_id"`
+	URL         string    `json:"url"`
+	Status      string    `json:"status"`
+	LastChecked time.Time `json:"last_checked"`
+}
+
+type WebsiteStatusConfig struct {
+	GuildID   string    `json:"guild_id"`
+	ChannelID string    `json:"channel_id"`
+	MessageID string    `json:"message_id"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type MySQLStore struct {
 	db   *sql.DB
 	lock sync.RWMutex
@@ -322,6 +345,36 @@ func (m *MySQLStore) createTables() error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			INDEX idx_ticket_channel (ticket_channel_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`,
+
+		`CREATE TABLE IF NOT EXISTS user_profiles (
+			user_id VARCHAR(32) PRIMARY KEY,
+			status VARCHAR(255) DEFAULT 'Không xác định',
+			verify BOOLEAN DEFAULT 0,
+			custom_fields JSON,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`,
+
+		`CREATE TABLE IF NOT EXISTS guild_profile_roles (
+			guild_id VARCHAR(32) NOT NULL,
+			role_id VARCHAR(32) NOT NULL,
+			PRIMARY KEY (guild_id, role_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+
+		`CREATE TABLE IF NOT EXISTS monitored_websites (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			guild_id VARCHAR(32) NOT NULL,
+			url VARCHAR(255) NOT NULL,
+			status VARCHAR(32) DEFAULT 'checking',
+			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			INDEX idx_guild (guild_id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+
+		`CREATE TABLE IF NOT EXISTS website_status_configs (
+			guild_id VARCHAR(32) PRIMARY KEY,
+			channel_id VARCHAR(32) DEFAULT '',
+			message_id VARCHAR(32) DEFAULT '',
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 	}
 
 	for _, q := range queries {
@@ -765,6 +818,63 @@ func (m *MySQLStore) MigrateLegacyData() {
 			break
 		}
 	}
+
+	// Di trú profiles.json nếu có
+	profilePaths := []string{"profiles.json", "../profiles.json", "D:\\DATA\\source\\KiyoBot\\profiles.json"}
+	for _, p := range profilePaths {
+		if pData, err := os.ReadFile(p); err == nil {
+			var rawProfiles map[string]map[string]interface{}
+			if err := json.Unmarshal(pData, &rawProfiles); err == nil && len(rawProfiles) > 0 {
+				var count int
+				_ = m.db.QueryRow("SELECT COUNT(*) FROM user_profiles").Scan(&count)
+				if count == 0 {
+					for uid, data := range rawProfiles {
+						status := "Không xác định"
+						if s, ok := data["status"].(string); ok && s != "" {
+							status = s
+						}
+						verify := false
+						if v, ok := data["verify"].(bool); ok {
+							verify = v
+						}
+						cf := make(map[string]string)
+						for k, v := range data {
+							if k != "status" && k != "verify" {
+								cf[k] = fmt.Sprintf("%v", v)
+							}
+						}
+						_ = m.SaveProfile(&UserProfile{
+							UserID:       uid,
+							Status:       status,
+							Verify:       verify,
+							CustomFields: cf,
+						})
+					}
+					log.Printf("Đã di trú %d profiles từ %s vào MySQL!", len(rawProfiles), p)
+				}
+			}
+			break
+		}
+	}
+
+	// Di trú roles.json nếu có
+	rolePaths := []string{"roles.json", "../roles.json", "D:\\DATA\\source\\KiyoBot\\roles.json"}
+	for _, p := range rolePaths {
+		if rData, err := os.ReadFile(p); err == nil {
+			var rawRoles map[string][]string
+			if err := json.Unmarshal(rData, &rawRoles); err == nil && len(rawRoles) > 0 {
+				var count int
+				_ = m.db.QueryRow("SELECT COUNT(*) FROM guild_profile_roles").Scan(&count)
+				if count == 0 {
+					for gid, rList := range rawRoles {
+						_ = m.SetGuildProfileRoles(gid, rList)
+					}
+					log.Printf("Đã di trú roles cho %d guilds từ %s vào MySQL!", len(rawRoles), p)
+				}
+			}
+			break
+		}
+	}
 }
 
 func (m *MySQLStore) Close() error {
@@ -1015,4 +1125,285 @@ func (m *MySQLStore) UpdateLastVideoID(id int, lastVideoID string) error {
 	_, err := m.db.Exec("UPDATE video_subscriptions SET last_video_id = ? WHERE id = ?", lastVideoID, id)
 	return err
 }
+
+// --- Profile Methods ---
+
+func (m *MySQLStore) GetProfile(userID string) (*UserProfile, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	var p UserProfile
+	var customFieldsJSON sql.NullString
+	query := `SELECT user_id, status, verify, custom_fields, updated_at FROM user_profiles WHERE user_id = ?`
+	row := m.db.QueryRow(query, userID)
+	err := row.Scan(&p.UserID, &p.Status, &p.Verify, &customFieldsJSON, &p.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return &UserProfile{
+				UserID:       userID,
+				Status:       "Không xác định",
+				Verify:       false,
+				CustomFields: make(map[string]string),
+			}, nil
+		}
+		return nil, err
+	}
+
+	p.CustomFields = make(map[string]string)
+	if customFieldsJSON.Valid && customFieldsJSON.String != "" {
+		_ = json.Unmarshal([]byte(customFieldsJSON.String), &p.CustomFields)
+	}
+	return &p, nil
+}
+
+func (m *MySQLStore) SaveProfile(p *UserProfile) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if p.CustomFields == nil {
+		p.CustomFields = make(map[string]string)
+	}
+	cfData, _ := json.Marshal(p.CustomFields)
+
+	query := `INSERT INTO user_profiles (user_id, status, verify, custom_fields)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE status = VALUES(status), verify = VALUES(verify), custom_fields = VALUES(custom_fields)`
+	_, err := m.db.Exec(query, p.UserID, p.Status, p.Verify, string(cfData))
+	return err
+}
+
+func (m *MySQLStore) ToggleProfileVerify(userID string) (bool, error) {
+	p, err := m.GetProfile(userID)
+	if err != nil {
+		return false, err
+	}
+	p.Verify = !p.Verify
+	err = m.SaveProfile(p)
+	return p.Verify, err
+}
+
+func (m *MySQLStore) UpdateProfileStatus(userID, status string) error {
+	p, err := m.GetProfile(userID)
+	if err != nil {
+		return err
+	}
+	p.Status = status
+	return m.SaveProfile(p)
+}
+
+func (m *MySQLStore) SetProfileCustomField(userID, field, val string) error {
+	p, err := m.GetProfile(userID)
+	if err != nil {
+		return err
+	}
+	if p.CustomFields == nil {
+		p.CustomFields = make(map[string]string)
+	}
+	p.CustomFields[field] = val
+	return m.SaveProfile(p)
+}
+
+func (m *MySQLStore) DeleteProfileCustomField(userID, field string) error {
+	p, err := m.GetProfile(userID)
+	if err != nil {
+		return err
+	}
+	if p.CustomFields != nil {
+		delete(p.CustomFields, field)
+	}
+	return m.SaveProfile(p)
+}
+
+func (m *MySQLStore) ResetProfile(userID string) error {
+	p := &UserProfile{
+		UserID:       userID,
+		Status:       "Không xác định",
+		Verify:       false,
+		CustomFields: make(map[string]string),
+	}
+	return m.SaveProfile(p)
+}
+
+func (m *MySQLStore) GetGuildProfileRoles(guildID string) ([]string, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	rows, err := m.db.Query("SELECT role_id FROM guild_profile_roles WHERE guild_id = ?", guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var roles []string
+	for rows.Next() {
+		var roleID string
+		if err := rows.Scan(&roleID); err == nil {
+			roles = append(roles, roleID)
+		}
+	}
+	return roles, nil
+}
+
+func (m *MySQLStore) SetGuildProfileRoles(guildID string, roles []string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec("DELETE FROM guild_profile_roles WHERE guild_id = ?", guildID)
+	stmt, err := tx.Prepare("INSERT INTO guild_profile_roles (guild_id, role_id) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, r := range roles {
+		if r != "" {
+			_, _ = stmt.Exec(guildID, r)
+		}
+	}
+	return tx.Commit()
+}
+
+// --- Website Monitoring Methods ---
+
+func (m *MySQLStore) GetMonitoredWebsites(guildID string) ([]*MonitoredWebsite, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	rows, err := m.db.Query("SELECT id, guild_id, url, status, last_checked FROM monitored_websites WHERE guild_id = ? ORDER BY id ASC", guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []*MonitoredWebsite
+	for rows.Next() {
+		var w MonitoredWebsite
+		if err := rows.Scan(&w.ID, &w.GuildID, &w.URL, &w.Status, &w.LastChecked); err == nil {
+			list = append(list, &w)
+		}
+	}
+	return list, nil
+}
+
+func (m *MySQLStore) GetAllMonitoredWebsites() ([]*MonitoredWebsite, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	rows, err := m.db.Query("SELECT id, guild_id, url, status, last_checked FROM monitored_websites ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []*MonitoredWebsite
+	for rows.Next() {
+		var w MonitoredWebsite
+		if err := rows.Scan(&w.ID, &w.GuildID, &w.URL, &w.Status, &w.LastChecked); err == nil {
+			list = append(list, &w)
+		}
+	}
+	return list, nil
+}
+
+func (m *MySQLStore) AddMonitoredWebsite(guildID, url string) (*MonitoredWebsite, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	var existingID int
+	err := m.db.QueryRow("SELECT id FROM monitored_websites WHERE guild_id = ? AND url = ?", guildID, url).Scan(&existingID)
+	if err == nil {
+		return nil, fmt.Errorf("website đã tồn tại trong danh sách")
+	}
+
+	res, err := m.db.Exec("INSERT INTO monitored_websites (guild_id, url, status, last_checked) VALUES (?, ?, 'checking', NOW())", guildID, url)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &MonitoredWebsite{
+		ID:          int(id),
+		GuildID:     guildID,
+		URL:         url,
+		Status:      "checking",
+		LastChecked: time.Now(),
+	}, nil
+}
+
+func (m *MySQLStore) DeleteMonitoredWebsites(guildID string, ids []int) ([]int, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	var deleted []int
+	for _, id := range ids {
+		res, err := m.db.Exec("DELETE FROM monitored_websites WHERE id = ? AND guild_id = ?", id, guildID)
+		if err == nil {
+			if count, _ := res.RowsAffected(); count > 0 {
+				deleted = append(deleted, id)
+			}
+		}
+	}
+	return deleted, nil
+}
+
+func (m *MySQLStore) UpdateWebsiteStatus(id int, status string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	_, err := m.db.Exec("UPDATE monitored_websites SET status = ?, last_checked = NOW() WHERE id = ?", status, id)
+	return err
+}
+
+func (m *MySQLStore) GetWebsiteStatusConfig(guildID string) (*WebsiteStatusConfig, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	var cfg WebsiteStatusConfig
+	err := m.db.QueryRow("SELECT guild_id, channel_id, message_id, updated_at FROM website_status_configs WHERE guild_id = ?", guildID).
+		Scan(&cfg.GuildID, &cfg.ChannelID, &cfg.MessageID, &cfg.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return &WebsiteStatusConfig{GuildID: guildID}, nil
+		}
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (m *MySQLStore) GetAllWebsiteStatusConfigs() ([]*WebsiteStatusConfig, error) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	rows, err := m.db.Query("SELECT guild_id, channel_id, message_id, updated_at FROM website_status_configs WHERE channel_id != ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []*WebsiteStatusConfig
+	for rows.Next() {
+		var cfg WebsiteStatusConfig
+		if err := rows.Scan(&cfg.GuildID, &cfg.ChannelID, &cfg.MessageID, &cfg.UpdatedAt); err == nil {
+			list = append(list, &cfg)
+		}
+	}
+	return list, nil
+}
+
+func (m *MySQLStore) SaveWebsiteStatusConfig(guildID, channelID, messageID string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	query := `INSERT INTO website_status_configs (guild_id, channel_id, message_id)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE channel_id = VALUES(channel_id), message_id = VALUES(message_id)`
+	_, err := m.db.Exec(query, guildID, channelID, messageID)
+	return err
+}
+
 

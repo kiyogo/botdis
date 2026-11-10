@@ -16,10 +16,12 @@ import (
 	"botdis/internal/modules/feed"
 	"botdis/internal/modules/leveling"
 	"botdis/internal/modules/moderation"
+	"botdis/internal/modules/profile"
 	"botdis/internal/modules/sticky"
 	"botdis/internal/modules/ticket"
 	"botdis/internal/modules/tiktok"
 	"botdis/internal/modules/utility"
+	"botdis/internal/modules/website"
 	"botdis/internal/modules/wordchain"
 	"botdis/internal/storage"
 
@@ -47,6 +49,11 @@ func main() {
 	}
 	defer store.Close()
 
+	sess, err := discordgo.New("Bot " + cfg.BotToken)
+	if err != nil {
+		log.Fatalf("Lỗi tạo Discord session: %v", err)
+	}
+
 	router := discord.NewRouter()
 	tiktokService := tiktok.NewService(store)
 	antiSpam := moderation.NewAntiSpam(store)
@@ -54,7 +61,11 @@ func main() {
 	utilityService := utility.NewService()
 	autorolesService := autoroles.NewService(store)
 	stickyService := sticky.NewService(store)
-	dashboardService := dashboard.NewService(store, stickyService)
+	profileService := profile.NewService(store)
+	websiteService := website.NewService(store, sess)
+	defer websiteService.Stop()
+
+	dashboardService := dashboard.NewService(store, stickyService, profileService, websiteService)
 	chataiService := chatai.NewService(cfg.AIAPIKey, cfg.LocalAIURL, store)
 	ticketService := ticket.NewService(store, chataiService)
 	feedService := feed.NewService(store)
@@ -72,14 +83,11 @@ func main() {
 	levelingService.RegisterRoutes(router)
 	utilityService.RegisterRoutes(router)
 	autorolesService.RegisterRoutes(router)
+	profileService.RegisterRoutes(router)
+	websiteService.RegisterRoutes(router)
 	dashboardService.RegisterRoutes(router)
 	wordchainService.RegisterRoutes(router)
 	antiSpam.RegisterCommands(router)
-
-	sess, err := discordgo.New("Bot " + cfg.BotToken)
-	if err != nil {
-		log.Fatalf("Lỗi tạo Discord session: %v", err)
-	}
 
 	sess.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
@@ -97,6 +105,22 @@ func main() {
 			{
 				Name:        "setting",
 				Description: "Bảng điều khiển cài đặt",
+			},
+			{
+				Name:        "profile",
+				Description: "Xem profile của một thành viên hoặc bản thân",
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:        discordgo.ApplicationCommandOptionUser,
+						Name:        "user",
+						Description: "Thành viên trong server cần xem profile",
+						Required:    false,
+					},
+				},
+			},
+			{
+				Name:        "sync",
+				Description: "Admin đồng bộ lại slash commands cho server và global",
 			},
 			{
 				Name:        "noitu",
@@ -212,7 +236,17 @@ func main() {
 			},
 		}
 
-		_, err := s.ApplicationCommandBulkOverwrite(s.State.User.ID, "", commands)
+		dashboardService.SetCommands(commands)
+
+		// Dọn sạch các lệnh cấp server (guild commands) cũ để tránh bị lặp 2 lệnh giống hệt nhau
+		guilds, err := s.UserGuilds(100, "", "", false)
+		if err == nil {
+			for _, g := range guilds {
+				_, _ = s.ApplicationCommandBulkOverwrite(s.State.User.ID, g.ID, []*discordgo.ApplicationCommand{})
+			}
+		}
+
+		_, err = s.ApplicationCommandBulkOverwrite(s.State.User.ID, "", commands)
 		if err != nil {
 			log.Printf("Lỗi đồng bộ slash commands: %v", err)
 		} else {

@@ -9,9 +9,11 @@ import (
 
 	"botdis/internal/discord"
 	"botdis/internal/modules/feed"
+	"botdis/internal/modules/profile"
 	"botdis/internal/modules/sticky"
 	"botdis/internal/modules/ticket"
 	"botdis/internal/modules/utility"
+	"botdis/internal/modules/website"
 	"botdis/internal/storage"
 
 	"github.com/bwmarrin/discordgo"
@@ -47,9 +49,12 @@ const (
 	SelectRoleMenuRoles = "setting_select_role_menu_roles"
 	RoleMenuAssign      = "role_menu_assign"
 
-	BtnViewBotInfo = "setting_view_botinfo"
-	BtnViewPing    = "setting_view_ping"
-	BtnBackToMain  = "setting_back"
+	BtnViewBotInfo        = "setting_view_botinfo"
+	BtnViewPing           = "setting_view_ping"
+	BtnViewProfileAdmin   = "setting_view_profile_admin"
+	BtnViewWebsiteAdmin   = "setting_view_website_admin"
+	BtnActionSyncCommands = "setting_action_sync_commands"
+	BtnBackToMain         = "setting_back"
 )
 
 type feedSessionState struct {
@@ -60,15 +65,24 @@ type feedSessionState struct {
 var userFeedState sync.Map
 
 type Service struct {
-	store         *storage.MySQLStore
-	stickyService *sticky.Service
+	store          *storage.MySQLStore
+	stickyService  *sticky.Service
+	profileService *profile.Service
+	websiteService *website.Service
+	commands       []*discordgo.ApplicationCommand
 }
 
-func NewService(store *storage.MySQLStore, stickyService *sticky.Service) *Service {
+func NewService(store *storage.MySQLStore, stickyService *sticky.Service, profileService *profile.Service, websiteService *website.Service) *Service {
 	return &Service{
-		store:         store,
-		stickyService: stickyService,
+		store:          store,
+		stickyService:  stickyService,
+		profileService: profileService,
+		websiteService: websiteService,
 	}
+}
+
+func (s *Service) SetCommands(cmds []*discordgo.ApplicationCommand) {
+	s.commands = cmds
 }
 
 func (s *Service) RegisterRoutes(r *discord.Router) {
@@ -119,7 +133,15 @@ func (s *Service) RegisterRoutes(r *discord.Router) {
 
 	r.RegisterComponent(BtnViewBotInfo, s.handleViewBotInfo)
 	r.RegisterComponent(BtnViewPing, s.handleViewPing)
+	r.RegisterComponent(BtnViewProfileAdmin, s.handleViewProfileAdmin)
+	r.RegisterComponent(BtnViewWebsiteAdmin, s.handleViewWebsiteAdmin)
+	r.RegisterComponent(BtnActionSyncCommands, s.handleActionSyncCommands)
 	r.RegisterComponent(BtnBackToMain, s.handleBackToMain)
+
+	r.RegisterComponent(profile.BtnProfileAdminBackToDashboard, s.handleBackToMain)
+	r.RegisterComponent(website.BtnWebsiteBackToDashboard, s.handleBackToMain)
+
+	r.RegisterCommand("sync", s.handleSyncCommand)
 }
 
 func (s *Service) handleSettingCommand(sess *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -413,8 +435,8 @@ func (s *Service) handleAutoRoleDelayPrompt(sess *discordgo.Session, i *discordg
 					Components: []discordgo.MessageComponent{
 						discordgo.TextInput{
 							CustomID:    "delay_seconds",
-							Label:       "Thời gian chờ cấp role (giây)",
-							Placeholder: "Ví dụ 0, 10, 30, 60... (0 là ngay lập tức)",
+							Label:       "Thời gian chờ",
+							Placeholder: "Số giây",
 							Value:       val,
 							Style:       discordgo.TextInputShort,
 							Required:    true,
@@ -576,29 +598,32 @@ func (s *Service) handleBackToMain(sess *discordgo.Session, i *discordgo.Interac
 
 func (s *Service) buildDashboardEmbed(guildID, channelID string) *discordgo.MessageEmbed {
 	return &discordgo.MessageEmbed{
-		Title:       "Bảng điều khiển bot",
-		Description: "Bấm vào các nút bên dưới để bật tắt hoặc quản lý tính năng",
+		Title:       "Cài đặt",
+		Description: "Chọn tính năng để quản lý",
 		Color:       0x3498db,
 		Fields: []*discordgo.MessageEmbedField{
 			{
-				Name: "Chống spam",
-				Value: "**Chặn link** Xóa tin nhắn chứa link\n" +
-					"**Chặn media** Xóa ảnh và video\n" +
-					"**Chặn file** Xóa các file đính kèm\n" +
-					"**Chặn chat** Chỉ xóa tin nhắn text thuần\n" +
-					"**Anti fast** Xóa toàn bộ tin nhắn khi gửi quá nhanh qua các kênh\n" +
-					"**Anti dup** Xóa toàn bộ tin nhắn khi gửi trùng lặp qua các kênh",
+				Name: "Chặn spam",
+				Value: "**Chặn link**\n" +
+					"**Chặn ảnh**\n" +
+					"**Chặn tệp**\n" +
+					"**Chặn chữ**\n" +
+					"**Gửi nhanh**\n" +
+					"**Gửi trùng**",
 			},
 			{
-				Name: "Tiện ích",
-				Value: "**TikTok** Tự động tải video không logo và nén theo server\n" +
-					"**Leveling** Hệ thống cộng điểm kinh nghiệm và cấp độ\n" +
-					"**AI chat** Trò chuyện tự động với AI\n" +
-					"**AutoRole** Gán role tự động cho thành viên mới\n" +
-					"**Ticket** Hệ thống hỗ trợ thành viên\n" +
-					"**Video mới** Tự động thông báo khi có video mới từ YouTube và TikTok\n" +
-					"**Gửi** Ghim tin nhắn luôn ở cuối kênh\n" +
-					"**Menu role** Tạo bảng tự chọn và nhận role",
+				Name: "Tính năng",
+				Value: "**Cấp độ**\n" +
+					"**Tiktok**\n" +
+					"**Trò chuyện**\n" +
+					"**Hỗ trợ**\n" +
+					"**Tự cấp vai trò**\n" +
+					"**Video**\n" +
+					"**Ghim**\n" +
+					"**Bảng vai trò**\n" +
+					"**Hồ sơ**\n" +
+					"**Website**\n" +
+					"**Đồng bộ**",
 			},
 		},
 	}
@@ -618,48 +643,48 @@ func (s *Service) buildDashboardComponents(guildID, channelID string) []discordg
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Cấm link", CustomID: "toggle_ac_link", Style: btnStyle(settings.ACLink)},
-				discordgo.Button{Label: "Cấm media", CustomID: "toggle_ac_media", Style: btnStyle(settings.ACMedia)},
-				discordgo.Button{Label: "Cấm file", CustomID: "toggle_ac_file", Style: btnStyle(settings.ACFile)},
-				discordgo.Button{Label: "Cấm chat", CustomID: "toggle_ac_text", Style: btnStyle(settings.ACText)},
+				discordgo.Button{Label: "Cấm ảnh", CustomID: "toggle_ac_media", Style: btnStyle(settings.ACMedia)},
+				discordgo.Button{Label: "Cấm tệp", CustomID: "toggle_ac_file", Style: btnStyle(settings.ACFile)},
+				discordgo.Button{Label: "Cấm chữ", CustomID: "toggle_ac_text", Style: btnStyle(settings.ACText)},
 			},
 		},
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
-				discordgo.Button{Label: "Anti fast", CustomID: "toggle_as_fast", Style: btnStyle(settings.ASFast)},
-				discordgo.Button{Label: "Anti dup", CustomID: "toggle_as_dup", Style: btnStyle(settings.ASDup)},
+				discordgo.Button{Label: "Gửi nhanh", CustomID: "toggle_as_fast", Style: btnStyle(settings.ASFast)},
+				discordgo.Button{Label: "Gửi trùng", CustomID: "toggle_as_dup", Style: btnStyle(settings.ASDup)},
 			},
 		},
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
-				discordgo.Button{Label: "Leveling", CustomID: "toggle_level_enabled", Style: btnStyle(settings.LevelEnabled)},
-				discordgo.Button{Label: "TikTok", CustomID: "toggle_tiktok_enabled", Style: btnStyle(settings.TikTokEnabled)},
-				discordgo.Button{Label: "AI chat", CustomID: "toggle_ai_enabled", Style: btnStyle(settings.AIEnabled)},
+				discordgo.Button{Label: "Cấp độ", CustomID: "toggle_level_enabled", Style: btnStyle(settings.LevelEnabled)},
+				discordgo.Button{Label: "Tiktok", CustomID: "toggle_tiktok_enabled", Style: btnStyle(settings.TikTokEnabled)},
+				discordgo.Button{Label: "Trò chuyện", CustomID: "toggle_ai_enabled", Style: btnStyle(settings.AIEnabled)},
 			},
 		},
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
 				discordgo.Button{
-					Label:    "Ticket",
+					Label:    "Hỗ trợ",
 					CustomID: BtnViewTicket,
 					Style:    discordgo.SecondaryButton,
 				},
 				discordgo.Button{
-					Label:    "AutoRole",
+					Label:    "Tự cấp vai trò",
 					CustomID: BtnViewAutoRole,
 					Style:    discordgo.SecondaryButton,
 				},
 				discordgo.Button{
-					Label:    "Video mới",
+					Label:    "Video",
 					CustomID: BtnViewFeed,
 					Style:    discordgo.SecondaryButton,
 				},
 				discordgo.Button{
-					Label:    "Gửi",
+					Label:    "Ghim",
 					CustomID: BtnSettingSticky,
 					Style:    discordgo.SecondaryButton,
 				},
 				discordgo.Button{
-					Label:    "Menu role",
+					Label:    "Bảng vai trò",
 					CustomID: BtnViewRoleMenu,
 					Style:    discordgo.SecondaryButton,
 				},
@@ -668,13 +693,28 @@ func (s *Service) buildDashboardComponents(guildID, channelID string) []discordg
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
 				discordgo.Button{
-					Label:    "Thông tin bot",
+					Label:    "Thông tin",
 					CustomID: BtnViewBotInfo,
 					Style:    discordgo.SecondaryButton,
 				},
 				discordgo.Button{
 					Label:    "Độ trễ",
 					CustomID: BtnViewPing,
+					Style:    discordgo.SecondaryButton,
+				},
+				discordgo.Button{
+					Label:    "Hồ sơ",
+					CustomID: BtnViewProfileAdmin,
+					Style:    discordgo.SecondaryButton,
+				},
+				discordgo.Button{
+					Label:    "Website",
+					CustomID: BtnViewWebsiteAdmin,
+					Style:    discordgo.SecondaryButton,
+				},
+				discordgo.Button{
+					Label:    "Đồng bộ",
+					CustomID: BtnActionSyncCommands,
 					Style:    discordgo.SecondaryButton,
 				},
 			},
@@ -1019,7 +1059,7 @@ func (s *Service) buildFeedConfigView(guildID, currentChannelID, userID string) 
 			discordgo.SelectMenu{
 				MenuType:    discordgo.RoleSelectMenu,
 				CustomID:    SelectFeedRole,
-				Placeholder: "Chọn role ping...",
+				Placeholder: "Chọn vai trò nhắc",
 			},
 		},
 	})
@@ -1030,7 +1070,7 @@ func (s *Service) buildFeedConfigView(guildID, currentChannelID, userID string) 
 			discordgo.SelectMenu{
 				MenuType:     discordgo.ChannelSelectMenu,
 				CustomID:     SelectFeedChannel,
-				Placeholder:  "Chọn kênh nhận thông báo video mới...",
+				Placeholder:  "Chọn kênh nhận video",
 				ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText},
 			},
 		},
@@ -1049,12 +1089,12 @@ func (s *Service) buildFeedConfigView(guildID, currentChannelID, userID string) 
 			}
 			label := fmt.Sprintf("[%s] %s", plat, sub.TargetName)
 			if len(label) > 100 {
-				label = label[:97] + "..."
+				label = label[:100]
 			}
 			delOptions = append(delOptions, discordgo.SelectMenuOption{
 				Label:       label,
 				Value:       fmt.Sprintf("%d", sub.ID),
-				Description: fmt.Sprintf("Kênh nhận: #%s", sub.ChannelID),
+				Description: fmt.Sprintf("Kênh #%s", sub.ChannelID),
 			})
 		}
 
@@ -1062,7 +1102,7 @@ func (s *Service) buildFeedConfigView(guildID, currentChannelID, userID string) 
 			Components: []discordgo.MessageComponent{
 				discordgo.SelectMenu{
 					CustomID:    SelectDeleteFeed,
-					Placeholder: "Chọn kênh video muốn xóa khỏi theo dõi...",
+					Placeholder: "Chọn kênh cần xóa",
 					Options:     delOptions,
 				},
 			},
@@ -1179,8 +1219,8 @@ func (s *Service) handleViewRoleMenu(sess *discordgo.Session, i *discordgo.Inter
 			Flags: discordgo.MessageFlagsEphemeral,
 			Embeds: []*discordgo.MessageEmbed{
 				{
-					Title:       "Tạo menu role",
-					Description: "Chọn các role muốn đưa vào menu tự nhận role (tối đa 25 role)",
+					Title:       "Bảng vai trò",
+					Description: "Chọn vai trò đưa vào bảng",
 					Color:       0x3498db,
 				},
 			},
@@ -1190,7 +1230,7 @@ func (s *Service) handleViewRoleMenu(sess *discordgo.Session, i *discordgo.Inter
 						discordgo.SelectMenu{
 							MenuType:    discordgo.RoleSelectMenu,
 							CustomID:    SelectRoleMenuRoles,
-							Placeholder: "Chọn các role đưa vào menu...",
+							Placeholder: "Chọn vai trò",
 							MinValues:   &minVal,
 							MaxValues:   25,
 						},
@@ -1306,7 +1346,7 @@ func (s *Service) handleSelectRoleMenuRoles(sess *discordgo.Session, i *discordg
 		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
 			Data: &discordgo.InteractionResponseData{
-				Content:    fmt.Sprintf("Lỗi khi gửi menu role vào kênh: %v", err),
+				Content:    fmt.Sprintf("Lỗi gửi bảng %v", err),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
 			},
@@ -1317,7 +1357,7 @@ func (s *Service) handleSelectRoleMenuRoles(sess *discordgo.Session, i *discordg
 	_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
-			Content:    "Đã gửi bảng menu role thành công vào kênh này",
+			Content:    "Đã gửi bảng thành công",
 			Embeds:     []*discordgo.MessageEmbed{},
 			Components: []discordgo.MessageComponent{},
 		},
@@ -1393,13 +1433,173 @@ func (s *Service) handleRoleMenuAssign(sess *discordgo.Session, i *discordgo.Int
 
 	var statusText string
 	if addedCount > 0 || removedCount > 0 {
-		statusText = fmt.Sprintf("Đã cập nhật role thành công (nhận %d, bỏ %d)", addedCount, removedCount)
+		statusText = fmt.Sprintf("Đã cập nhật vai trò nhận %d bỏ %d", addedCount, removedCount)
 	} else {
-		statusText = "Đã cập nhật role thành công (không có thay đổi)"
+		statusText = "Đã cập nhật vai trò không có thay đổi"
 	}
 
 	_, _ = sess.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 		Content: statusText,
 	})
 }
+
+func (s *Service) handleViewProfileAdmin(sess *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !s.isUserAdmin(sess, i.GuildID, i.Member.User.ID) {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Bạn cần quyền Administrator để quản lý Profile",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	if s.profileService == nil {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Dịch vụ Profile chưa khả dụng.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	embed, components := s.profileService.BuildProfileSelectMemberView()
+	_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+		},
+	})
+}
+
+func (s *Service) handleViewWebsiteAdmin(sess *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !s.isUserAdmin(sess, i.GuildID, i.Member.User.ID) {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Bạn cần quyền Administrator để quản lý Website",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	if s.websiteService == nil {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Dịch vụ Website chưa khả dụng.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	embed, components := s.websiteService.BuildWebsiteAdminView(i.GuildID, i.ChannelID)
+	_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+		},
+	})
+}
+
+func (s *Service) handleActionSyncCommands(sess *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !s.isUserAdmin(sess, i.GuildID, i.Member.User.ID) {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Bạn cần quyền Administrator để đồng bộ lệnh.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	count, err := s.SyncCommands(sess, i.GuildID)
+	if err != nil {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("Lỗi đồng bộ lệnh %v", err),
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("Đã đồng bộ thành công %d lệnh", count),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+}
+
+func (s *Service) handleSyncCommand(sess *discordgo.Session, i *discordgo.InteractionCreate) {
+	userID := ""
+	if i.Member != nil && i.Member.User != nil {
+		userID = i.Member.User.ID
+	} else if i.User != nil {
+		userID = i.User.ID
+	}
+
+	if !s.isUserAdmin(sess, i.GuildID, userID) {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Bạn cần quyền Administrator để dùng lệnh này",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	count, err := s.SyncCommands(sess, i.GuildID)
+	if err != nil {
+		_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("Lỗi đồng bộ lệnh %v", err),
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	_ = sess.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("Đã đồng bộ thành công %d lệnh", count),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+}
+
+func (s *Service) SyncCommands(sess *discordgo.Session, guildID string) (int, error) {
+	if len(s.commands) == 0 {
+		return 0, fmt.Errorf("danh sách commands đang trống")
+	}
+
+	appID := sess.State.User.ID
+
+	// Xóa các lệnh cấp guild để tránh bị lặp đôi 2 lệnh giống hệt nhau
+	if guildID != "" {
+		_, _ = sess.ApplicationCommandBulkOverwrite(appID, guildID, []*discordgo.ApplicationCommand{})
+	}
+
+	// Đồng bộ danh sách lệnh Global chuẩn
+	_, err := sess.ApplicationCommandBulkOverwrite(appID, "", s.commands)
+	if err != nil {
+		return 0, err
+	}
+	return len(s.commands), nil
+}
+
 
